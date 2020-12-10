@@ -2,11 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"github.com/go-pg/pg/v10"
@@ -15,12 +10,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"io/ioutil"
 	"log"
-	"math/big"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 )
 
 var (
@@ -41,14 +33,13 @@ type Customer struct {
 }
 
 type Certificate struct {
-	Id         int64  `json:"id"`
-	CustomerId string `json:"customerId"`
-	PrivateKey string `json:"privateKey"`
-	Body       string `json:"body"`
-	Active     bool   `json:"active"`
-	Created    string `json:"created"`
-	Updated    string `json:"updated"`
-	DB         *pg.DB `json:"-"`
+	Id         int64              `json:"id"`
+	CustomerId string             `json:"customerId"`
+	Options    CertificateOptions `json:"options"`
+	Active     bool               `json:"active"`
+	Created    string             `json:"created"`
+	Updated    string             `json:"updated"`
+	DB         *pg.DB             `json:"-"`
 }
 
 func init() {
@@ -69,6 +60,17 @@ func init() {
 		}
 		db = database
 		log.Print("Database connected.")
+	}
+	//generate CA cert and private key for signing certificate requests
+	if caCert == nil || caPrivKey == nil {
+		log.Print("Generating CA certificate and private key")
+		_, _, err := generateCertificate(certificateAuthority)
+		if err != nil {
+			log.Fatalf("Failed to generate the CA certificate and private key: %v", err)
+		} else if caCert == nil || caPrivKey == nil {
+			log.Fatalf("Failed to assign the CA certificate and private key durign generation")
+		}
+		log.Print("CA certificate and private key generated successfully")
 	}
 }
 
@@ -120,7 +122,7 @@ func createCustomer(w http.ResponseWriter, r *http.Request) {
 	}
 	err = customer.Create()
 	if err != nil {
-		http.Error(w, "Error returned when saving customer. Check request data.", http.StatusInternalServerError)
+		http.Error(w, "Error returned when saving customer. Check request data.", http.StatusBadRequest)
 		return
 	}
 
@@ -194,11 +196,25 @@ func createCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	certDetails := &CertificateOptions{
+		Subject:        t.Options.Subject,
+		ExpYearsLength: t.Options.ExpYearsLength,
+		Hosts:          t.Options.Hosts,
+		isCA:           false,
+	}
+
+	newCert, privateKey, err := generateCertificate(certDetails)
+	if err != nil {
+		http.Error(w, "Error returned when generating the certificate. Check request data.", http.StatusInternalServerError)
+		return
+	}
+
+	// all certs are active when created
 	cert = &pgc.Certificate{
 		CustomerId: customerId,
-		PrivateKey: t.PrivateKey,
-		Body:       t.Body,
-		Active:     t.Active,
+		PrivateKey: privateKey.String(),
+		Body:       newCert.String(),
+		Active:     true,
 		DB:         db,
 	}
 
@@ -208,29 +224,42 @@ func createCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	m := map[string]string{
-		"Id":         string(cert.Id),
-		"CustomerId": string(cert.CustomerId),
-	}
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(m)
+	_ = json.NewEncoder(w).Encode(cert)
 }
 
 func updateCertificate(w http.ResponseWriter, r *http.Request) {
-	reqBody, _ := ioutil.ReadAll(r.Body)
 	var (
-		t    Certificate
-		cert *pgc.Certificate
+		active bool
+		notify bool
 	)
-	err := json.Unmarshal(reqBody, &t)
+	err := r.ParseForm()
 	if err != nil {
 		http.Error(w, "Malformed Request.", http.StatusBadRequest)
 		return
 	}
+
 	tId := mux.Vars(r)["cert_id"]
-	notify := r.FormValue("notify")
-	log.Printf("notify: %v", notify)
+	a := r.Form.Get("active")
+	n := r.Form.Get("notify")
+
+	if len(a) == 0 {
+		http.Error(w, "Malformed Request. Active parameter should be set to true or false.", http.StatusBadRequest)
+		return
+	}
+	active, err = strconv.ParseBool(a)
+	if err != nil {
+		http.Error(w, "Malformed Request.", http.StatusBadRequest)
+		return
+	}
+	if len(n) > 0 {
+		notify, err = strconv.ParseBool(n)
+		if err != nil {
+			http.Error(w, "Malformed Request.", http.StatusBadRequest)
+			return
+		}
+	}
 
 	certId, err := strconv.ParseInt(tId, 10, 64)
 	if err != nil {
@@ -238,7 +267,7 @@ func updateCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cert = &pgc.Certificate{
+	cert := &pgc.Certificate{
 		Id: certId,
 		DB: db,
 	}
@@ -249,9 +278,9 @@ func updateCertificate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// only handling changes to 'active' field, all other changes are ignored
-	if cert.Active != t.Active {
+	if cert.Active != active {
 		var notification string
-		if notify == "true" {
+		if notify {
 			customer := &pgc.Customer{
 				Id: cert.CustomerId,
 				DB: db,
@@ -261,15 +290,15 @@ func updateCertificate(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Customer not found. Validate request data.", http.StatusNotFound)
 				return
 			}
-			successMessage, err := sendNotification(customer, cert, t.Active)
+			successMessage, err := sendNotification(customer, cert, active)
 			if err != nil {
-				http.Error(w, "External notification failed.", http.StatusFailedDependency)
+				http.Error(w, "External notification failed. Aborting request.", http.StatusFailedDependency)
 				return
 			}
 			notification = successMessage
 		}
 
-		cert.Active = t.Active
+		cert.Active = active
 
 		err = cert.Update()
 		if err != nil {
@@ -277,9 +306,9 @@ func updateCertificate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m := map[string]string{
-			"Id":         string(cert.Id),
-			"CustomerId": string(cert.CustomerId),
-			"Active":     strconv.FormatBool(t.Active),
+			"CertificateId": string(cert.Id),
+			"CustomerId":    string(cert.CustomerId),
+			"Active":        strconv.FormatBool(cert.Active),
 		}
 		if notification != "" {
 			m["Notification"] = notification
@@ -363,62 +392,4 @@ func sendNotification(customer *pgc.Customer, cert *pgc.Certificate, newStatus b
 
 	successMsg := fmt.Sprintf("Successfully sent status change notification request to %v. response: %v", "https://httpbin.org/post", resp.StatusCode)
 	return successMsg, nil
-}
-
-func generateCertificate() {
-	cert := &x509.Certificate{
-		SerialNumber: big.NewInt(1658),
-		Subject: pkix.Name{
-			Organization:  []string{"Company, INC."},
-			//Country:       []string{"US"},
-			//Province:      []string{""},
-			//Locality:      []string{"San Francisco"},
-			//StreetAddress: []string{"Golden Gate Bridge"},
-			//PostalCode:    []string{"94016"},
-		},
-		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(10, 0, 0),
-		//SubjectKeyId: []byte{1, 2, 3, 4, 6},
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-	}
-
-	certPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return err
-	}
-
-	x509.CreateCertificate(rand.Reader, cert, )
-}
-
-func createCertificateAuthority() {
-	ca := &x509.Certificate{
-		SerialNumber: big.NewInt(2019),
-		Subject: pkix.Name{
-			Organization:  []string{"Company, INC."},
-			Country:       []string{"US"},
-			Province:      []string{""},
-			Locality:      []string{"San Francisco"},
-			StreetAddress: []string{"Golden Gate Bridge"},
-			PostalCode:    []string{"94016"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		IsCA:                  true,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-
-	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return err
-	}
-
-	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
-	if err != nil {
-		return err
-	}
-
 }

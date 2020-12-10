@@ -19,6 +19,7 @@ services:
     networks:
       - cert-manager
   app:
+    container_name: cert-manager
     build:
       context: ../.
       dockerfile: ./certificate-manager/Dockerfile
