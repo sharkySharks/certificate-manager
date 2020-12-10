@@ -1,0 +1,36 @@
+version: '3'
+
+networks:
+  cert-manager:
+    driver: bridge
+services:
+  db:
+    container_name: pg-db
+    image: postgres:13.1-alpine
+    ports:
+      - "5432:5432"
+    expose:
+      - "5432"
+    env_file:
+      - ../.env
+    restart: on-failure
+    volumes:
+      - database-data:/var/lib/postgresql/data/
+    networks:
+      - cert-manager
+  tests:
+    container_name: pg-tests
+    build:
+      context: ../
+      dockerfile: ./postgres/Dockerfile-test
+    env_file:
+      - ../.env
+    environment:
+      - POSTGRES_HOST=pg-db
+      - POSTGRES_PORT=5432
+    depends_on:
+      - db
+    networks:
+      - cert-manager
+volumes:
+  database-data:
